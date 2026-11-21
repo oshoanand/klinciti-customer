@@ -16,6 +16,7 @@ import '../../features/auth/providers/auth_provider.dart';
 import '../../features/auth/presentation/auth_bottom_sheet.dart';
 import '../../core/network/api_client.dart';
 import '../../core/utils/phone_formatter.dart';
+import '../../core/router/route_names.dart';
 
 final isAvatarUploadingProvider = StateProvider.autoDispose<bool>(
   (ref) => false,
@@ -190,14 +191,6 @@ class ProfileDrawer extends ConsumerWidget {
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
-                  // const Text(
-                  //   'Меню',
-                  //   style: TextStyle(
-                  //     fontSize: 24,
-                  //     fontWeight: FontWeight.w900,
-                  //     color: Color(0xFF0F172A),
-                  //   ),
-                  // ),
                   IconButton(
                     icon: const Icon(LucideIcons.x, color: Colors.grey),
                     onPressed: () => Navigator.pop(context),
@@ -266,36 +259,6 @@ class ProfileDrawer extends ConsumerWidget {
                                     ),
                                   ),
                                 ),
-
-                              // CAMERA BADGE
-                              // Positioned(
-                              //   bottom: -2,
-                              //   right: -2,
-                              //   child: GestureDetector(
-                              //     onTap: isUploading
-                              //         ? null
-                              //         : () => _showImageSourcePicker(
-                              //             context,
-                              //             ref,
-                              //           ),
-                              //     child: Container(
-                              //       padding: const EdgeInsets.all(6),
-                              //       decoration: BoxDecoration(
-                              //         color: const Color(0xFF0F172A),
-                              //         shape: BoxShape.circle,
-                              //         border: Border.all(
-                              //           color: Colors.white,
-                              //           width: 2,
-                              //         ),
-                              //       ),
-                              //       child: const Icon(
-                              //         LucideIcons.camera,
-                              //         color: Colors.white,
-                              //         size: 14,
-                              //       ),
-                              //     ),
-                              //   ),
-                              // ),
                             ],
                           ),
                           const SizedBox(width: 16),
@@ -348,14 +311,35 @@ class ProfileDrawer extends ConsumerWidget {
                       },
                     ),
                     _MenuItem(
-                      icon: LucideIcons.package,
+                      icon: LucideIcons.clipboard_list,
                       title: 'Мои заказы',
-                      subtitle: 'Все созданные заявки',
+                      subtitle: 'Активные и завершенные заявки',
                       onTap: () {
-                        Navigator.pop(context);
-                        context.push('/orders');
+                        Navigator.of(context).pop();
+                        context.push(AppRoutes.jobs);
                       },
                     ),
+                    _MenuItem(
+                      icon: LucideIcons.credit_card,
+                      title: 'Способы оплаты',
+                      subtitle: 'Привязанные банковские карты',
+                      iconColor: Colors.teal,
+                      onTap: () {
+                        Navigator.of(context).pop();
+                        context.push(AppRoutes.paymentMethods);
+                      },
+                    ),
+                    _MenuItem(
+                      icon: LucideIcons.arrow_left_right,
+                      title: 'Транзакции',
+                      subtitle: 'История оплат, счетов и возвратов',
+                      iconColor: const Color(0xFF2563EB),
+                      onTap: () {
+                        Navigator.of(context).pop();
+                        context.push(AppRoutes.customerTransactions);
+                      },
+                    ),
+
                     const Divider(height: 32, color: Color(0xFFF1F5F9)),
                   ] else ...[
                     // ==========================================
@@ -399,20 +383,20 @@ class ProfileDrawer extends ConsumerWidget {
                   // ==========================================
                   // COMMON LINKS
                   // ==========================================
-                  _MenuItem(
-                    icon: LucideIcons.message_square_text,
-                    title: 'Служба поддержки',
-                    subtitle: 'Помощь и история обращений',
-                    iconColor: const Color(0xFFF59E0B),
-                    onTap: () {
-                      Navigator.pop(context);
-                      if (!isAuthenticated) {
-                        showAuthBottomSheet(context);
-                      } else {
-                        context.push('/support');
-                      }
-                    },
-                  ),
+                  // _MenuItem(
+                  //   icon: LucideIcons.message_square_text,
+                  //   title: 'Служба поддержки',
+                  //   subtitle: 'Помощь и история обращений',
+                  //   iconColor: const Color(0xFFF59E0B),
+                  //   onTap: () {
+                  //     Navigator.pop(context);
+                  //     if (!isAuthenticated) {
+                  //       showAuthBottomSheet(context);
+                  //     } else {
+                  //       context.push('/support');
+                  //     }
+                  //   },
+                  // ),
                   if (isAuthenticated) ...[
                     const Divider(height: 32, color: Color(0xFFF1F5F9)),
                     _MenuItem(

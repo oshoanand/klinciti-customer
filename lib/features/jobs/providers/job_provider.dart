@@ -2,117 +2,226 @@ import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../domain/job_model.dart';
+import '../data/job_model.dart';
 import '../data/job_repository.dart';
 
+export '../data/job_model.dart';
+
 // ==========================================
-// 1. FETCH PROVIDERS (READ)
+// 1. READ PROVIDERS
 // ==========================================
 
-/// Fetches the list of all jobs for the current logged-in customer.
-final customerJobsProvider = FutureProvider.autoDispose<List<JobModel>>((ref) {
-  final repository = ref.watch(jobRepositoryProvider);
-  return repository.fetchCustomerJobs();
-});
-
-/// Fetches a single job by its ID (useful for the Edit Screen).
-final jobDetailsProvider = FutureProvider.family.autoDispose<JobModel, String>((
+/// Aggregated customer job counts per status
+final customerJobStatsProvider = FutureProvider.autoDispose<CustomerJobStats>((
   ref,
-  jobId,
 ) {
-  final repository = ref.watch(jobRepositoryProvider);
-  return repository.fetchJobDetails(jobId);
+  return ref.watch(jobRepositoryProvider).fetchJobStats();
 });
 
-// ==========================================
-// 2. MUTATION PROVIDER (CREATE, UPDATE, DELETE)
-// ==========================================
-
-/// Provides the loading state (true/false) while a job is being submitted/deleted
-final jobMutationStateProvider =
-    StateNotifierProvider.autoDispose<JobMutationNotifier, bool>((ref) {
-      return JobMutationNotifier(ref.watch(jobRepositoryProvider), ref);
+/// Paginated list provider per status tab
+final customerJobsListProvider = AsyncNotifierProvider.family
+    .autoDispose<CustomerJobsListNotifier, PaginatedJobsState, String>(() {
+      return CustomerJobsListNotifier();
     });
 
-class JobMutationNotifier extends StateNotifier<bool> {
-  final JobRepository _repository;
+class CustomerJobsListNotifier
+    extends AutoDisposeFamilyAsyncNotifier<PaginatedJobsState, String> {
+  static const int _pageSize = 20;
+
+  @override
+  Future<PaginatedJobsState> build(String arg) {
+    return ref
+        .read(jobRepositoryProvider)
+        .fetchJobsByStatus(status: arg, page: 1, limit: _pageSize);
+  }
+
+  Future<void> refresh() async {
+    state = const AsyncValue.loading();
+    state = await AsyncValue.guard(
+      () => ref
+          .read(jobRepositoryProvider)
+          .fetchJobsByStatus(status: arg, page: 1, limit: _pageSize),
+    );
+  }
+
+  Future<void> loadMore() async {
+    final current = state.valueOrNull;
+    if (current == null || !current.hasMore || current.isLoadingMore) return;
+
+    state = AsyncValue.data(current.copyWith(isLoadingMore: true));
+
+    try {
+      final nextPage = current.page + 1;
+      final nextResult = await ref
+          .read(jobRepositoryProvider)
+          .fetchJobsByStatus(status: arg, page: nextPage, limit: _pageSize);
+
+      // Deduplicate by job ID when appending pages
+      final existingIds = current.items.map((j) => j.id).toSet();
+      final uniqueNew = nextResult.items
+          .where((j) => !existingIds.contains(j.id))
+          .toList();
+
+      state = AsyncValue.data(
+        current.copyWith(
+          items: [...current.items, ...uniqueNew],
+          page: nextPage,
+          total: nextResult.total,
+          hasMore: nextResult.hasMore,
+          isLoadingMore: false,
+        ),
+      );
+    } catch (_) {
+      state = AsyncValue.data(current.copyWith(isLoadingMore: false));
+    }
+  }
+}
+
+/// Full details of a single job
+final customerJobDetailProvider = FutureProvider.family
+    .autoDispose<CustomerJobModel, String>((ref, jobId) {
+      return ref.watch(jobRepositoryProvider).fetchJobDetail(jobId);
+    });
+
+// ==========================================
+// 2. MUTATION NOTIFIER (Cancel, Dispute, Safe Deal Payment)
+// ==========================================
+
+final customerJobMutationProvider =
+    StateNotifierProvider.autoDispose<CustomerJobMutationNotifier, bool>((ref) {
+      return CustomerJobMutationNotifier(ref);
+    });
+
+class CustomerJobMutationNotifier extends StateNotifier<bool> {
   final Ref _ref;
 
-  JobMutationNotifier(this._repository, this._ref) : super(false);
-  // Inside JobMutationNotifier...
+  CustomerJobMutationNotifier(this._ref) : super(false);
 
-  Future<void> createJob({
+  void _invalidateJobProviders(String jobId) {
+    _ref.invalidate(customerJobStatsProvider);
+    _ref.invalidate(customerJobDetailProvider(jobId));
+
+    for (final status in const [
+      'PENDING',
+      'ACCEPTED',
+      'ONGOING',
+      'PAYMENT_PENDING',
+      'PAID',
+      'COMPLETED',
+      'DISPUTED',
+      'CANCELLED',
+    ]) {
+      _ref.invalidate(customerJobsListProvider(status));
+    }
+  }
+
+  Future<String> cancelJob(String jobId) async {
+    state = true;
+    try {
+      final message = await _ref.read(jobRepositoryProvider).cancelJob(jobId);
+      _invalidateJobProviders(jobId);
+      return message;
+    } finally {
+      if (mounted) state = false;
+    }
+  }
+
+  Future<String> disputeJob({
+    required String jobId,
+    required String reason,
+  }) async {
+    state = true;
+    try {
+      final message = await _ref
+          .read(jobRepositoryProvider)
+          .disputeJob(jobId: jobId, reason: reason);
+      _invalidateJobProviders(jobId);
+      return message;
+    } finally {
+      if (mounted) state = false;
+    }
+  }
+
+  Future<String> initiateSafeDealPayment(String jobId) async {
+    state = true;
+    try {
+      return await _ref
+          .read(jobRepositoryProvider)
+          .initiateSafeDealPayment(jobId);
+    } finally {
+      if (mounted) state = false;
+    }
+  }
+
+  /// Creates a new job and refreshes dashboard stats and PENDING job lists
+  Future<CustomerJobModel> createJob({
     required String categoryId,
-    required List<String> subcategoryIds, // ✅ CHANGED to List
+    required List<String> subcategoryIds,
     required String description,
     required String address,
     required String timing,
-    required String? budget,
+    String? budget,
+    String? city,
     required List<File> localPhotos,
   }) async {
     state = true;
     try {
-      await _repository.createJob(
-        categoryId: categoryId,
-        subcategoryIds: subcategoryIds, // ✅ Forward array
-        description: description,
-        address: address,
-        timing: timing,
-        budget: budget,
-        localPhotos: localPhotos,
-      );
-      _ref.invalidate(customerJobsProvider);
-      state = false;
-    } catch (e) {
-      state = false;
-      rethrow;
+      final created = await _ref
+          .read(jobRepositoryProvider)
+          .createJob(
+            categoryId: categoryId,
+            subcategoryIds: subcategoryIds,
+            description: description,
+            address: address,
+            timing: timing,
+            budget: budget,
+            city: city,
+            localPhotos: localPhotos,
+          );
+
+      _ref.invalidate(customerJobStatsProvider);
+      _ref.invalidate(customerJobsListProvider('PENDING'));
+      _ref.invalidate(customerJobsListProvider('ALL'));
+
+      return created;
+    } finally {
+      if (mounted) state = false;
     }
   }
 
-  Future<void> updateJob({
+  /// Updates a PENDING job and invalidates detail, list, and stats caches
+  Future<CustomerJobModel> updateJob({
     required String jobId,
     required String categoryId,
-    required List<String> subcategoryIds, // ✅ CHANGED to List
+    required List<String> subcategoryIds,
     required String description,
     required String address,
     required String timing,
-    required String? budget,
+    String? budget,
+    String? city,
     required List<String> existingPhotos,
     required List<File> newPhotos,
   }) async {
     state = true;
     try {
-      await _repository.updateJob(
-        jobId: jobId,
-        categoryId: categoryId,
-        subcategoryIds: subcategoryIds, // ✅ Forward array
-        description: description,
-        address: address,
-        timing: timing,
-        budget: budget,
-        existingPhotos: existingPhotos,
-        newPhotos: newPhotos,
-      );
-
-      _ref.invalidate(customerJobsProvider);
-      _ref.invalidate(jobDetailsProvider(jobId));
-      state = false;
-    } catch (e) {
-      state = false;
-      rethrow;
-    }
-  }
-
-  Future<void> deleteJob(String jobId) async {
-    state = true;
-    try {
-      await _repository.deleteJob(jobId);
-
-      _ref.invalidate(customerJobsProvider);
-      state = false;
-    } catch (e) {
-      state = false;
-      rethrow;
+      final updated = await _ref
+          .read(jobRepositoryProvider)
+          .updateJob(
+            jobId: jobId,
+            categoryId: categoryId,
+            subcategoryIds: subcategoryIds,
+            description: description,
+            address: address,
+            timing: timing,
+            budget: budget,
+            city: city,
+            existingPhotos: existingPhotos,
+            newPhotos: newPhotos,
+          );
+      _invalidateJobProviders(jobId);
+      return updated;
+    } finally {
+      if (mounted) state = false;
     }
   }
 }

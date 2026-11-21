@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:developer';
 
@@ -27,6 +28,10 @@ final authControllerProvider = Provider<AuthController>((ref) {
 // 3. AUTH CONTROLLER IMPLEMENTATION
 // ==========================================
 class AuthController {
+  static const String _jwtKey = 'jwt_token';
+  static const String _userIdKey = 'user_id';
+  static const String _userDataKey = 'user_data';
+
   final ApiClient _api;
   final Ref _ref;
 
@@ -34,42 +39,39 @@ class AuthController {
 
   Future<void> checkInitialAuth() async {
     try {
-      final token = await _api.storage.read(key: 'jwt_token');
-      final userId = await _api.storage.read(key: 'user_id');
-      final userDataStr = await _api.storage.read(key: 'user_data');
+      final results = await Future.wait([
+        _api.storage.read(key: _jwtKey),
+        _api.storage.read(key: _userIdKey),
+        _api.storage.read(key: _userDataKey),
+      ]);
 
-      // ✅ FIX: Ensure ALL required data exists before marking as authenticated
+      final token = results[0];
+      final userId = results[1];
+      final userDataStr = results[2];
+
       if (token != null &&
           token.isNotEmpty &&
           userId != null &&
-          userDataStr != null) {
-        final userData = jsonDecode(userDataStr) as Map<String, dynamic>;
+          userId.isNotEmpty &&
+          userDataStr != null &&
+          userDataStr.isNotEmpty) {
+        final decoded = jsonDecode(userDataStr);
+        if (decoded is! Map) {
+          throw const FormatException('Corrupt user_data format');
+        }
+
+        final userData = Map<String, dynamic>.from(decoded);
         _ref.read(currentUserProvider.notifier).state = userData;
         _ref.read(isAuthenticatedProvider.notifier).state = true;
 
-        // ISOLATED TRY-CATCH: Setup FCM & Socket without breaking auth
-        try {
-          final mobile = userData['mobile']?.toString();
-          final notifService = _ref.read(notificationServiceProvider);
-
-          // 1. Register Token & Topics
-          await notifService.registerTokenAfterLogin();
-          await notifService.subscribeToUserTopics(mobile);
-
-          // 2. Connect Real-time Socket
-          await _ref.read(socketServiceProvider).connect(userId);
-        } catch (e) {
-          log('FCM/Socket Setup Error (Ignored): $e');
-        }
+        // Run FCM & Socket initialization in the background so cold start isn't blocked
+        unawaited(_initRealtimeServices(userId));
       } else {
-        // If data is corrupt or missing, ensure a clean logged-out state
-        _ref.read(isAuthenticatedProvider.notifier).state = false;
-        _ref.read(currentUserProvider.notifier).state = null;
+        await clearSession();
       }
     } catch (e) {
-      // Only reach here if storage read fails entirely
-      _ref.read(isAuthenticatedProvider.notifier).state = false;
-      _ref.read(currentUserProvider.notifier).state = null;
+      log('⚠️ Initial auth check failed, clearing corrupt session: $e');
+      await clearSession();
     }
   }
 
@@ -77,95 +79,117 @@ class AuthController {
     try {
       final response = await _api.dio.post(
         '/auth/login',
-        data: {'identifier': identifier, 'password': password},
+        data: {'identifier': identifier.trim(), 'password': password},
       );
-      await saveSession(response.data);
+
+      if (response.data is! Map) {
+        throw ApiException('Некорректный ответ сервера при входе');
+      }
+
+      await saveSession(Map<String, dynamic>.from(response.data as Map));
     } catch (e) {
-      throw ApiException.fromDioException(e as dynamic);
+      if (e is ApiException) rethrow;
+      throw ApiException.fromDioException(e);
     }
   }
 
   Future<void> saveSession(Map<String, dynamic> data) async {
-    final token = data['accessToken'] ?? data['token'];
-    final userObject = data['user'];
-    final userId = userObject?['id'] ?? data['userId'];
+    final payload = data['data'] is Map
+        ? Map<String, dynamic>.from(data['data'] as Map)
+        : data;
 
-    if (token != null) {
-      // 1. Save auth data to storage
-      await _api.storage.write(key: 'jwt_token', value: token);
+    final String token = (payload['accessToken'] ?? payload['token'] ?? '')
+        .toString()
+        .trim();
+    final Map<String, dynamic>? userObject = payload['user'] is Map
+        ? Map<String, dynamic>.from(payload['user'] as Map)
+        : null;
+    final String userId = (userObject?['id'] ?? payload['userId'] ?? '')
+        .toString()
+        .trim();
 
-      if (userId != null) {
-        await _api.storage.write(key: 'user_id', value: userId.toString());
-      }
-
-      if (userObject != null) {
-        await _api.storage.write(
-          key: 'user_data',
-          value: jsonEncode(userObject),
-        );
-
-        // Safely cast the map
-        _ref.read(currentUserProvider.notifier).state =
-            Map<String, dynamic>.from(userObject);
-
-        // =======================================================
-        // 2. FCM & SOCKET BEST PRACTICE: REGISTER DEVICE
-        // =======================================================
-        try {
-          final mobile = userObject['mobile']?.toString();
-          final notifService = _ref.read(notificationServiceProvider);
-
-          // Must happen AFTER token is set in storage/Dio headers
-          await notifService.registerTokenAfterLogin();
-          await notifService.subscribeToUserTopics(mobile);
-
-          // Connect Socket immediately on login
-          await _ref.read(socketServiceProvider).connect(userId.toString());
-        } catch (e) {
-          log('Setup Error on Login (Ignored): $e');
-        }
-      }
-
-      // 3. Update Auth State
-      _ref.read(isAuthenticatedProvider.notifier).state = true;
+    if (token.isEmpty || userId.isEmpty) {
+      throw ApiException('Сервер не вернул токен или ID пользователя');
     }
+
+    // 1. Persist session to secure storage
+    await Future.wait([
+      _api.storage.write(key: _jwtKey, value: token),
+      _api.storage.write(key: _userIdKey, value: userId),
+      if (userObject != null)
+        _api.storage.write(key: _userDataKey, value: jsonEncode(userObject)),
+    ]);
+
+    // 2. Update Riverpod auth state
+    if (userObject != null) {
+      _ref.read(currentUserProvider.notifier).state = userObject;
+    }
+    _ref.read(isAuthenticatedProvider.notifier).state = true;
+
+    // 3. Register FCM token & open Socket.io connection independently
+    unawaited(_initRealtimeServices(userId));
+  }
+
+  /// Keeps Riverpod state and secure storage in sync after profile/avatar edits.
+  Future<void> updateCurrentUser(Map<String, dynamic> updatedFields) async {
+    final current = _ref.read(currentUserProvider) ?? <String, dynamic>{};
+    final merged = <String, dynamic>{...current, ...updatedFields};
+
+    _ref.read(currentUserProvider.notifier).state = merged;
+    await _api.storage.write(key: _userDataKey, value: jsonEncode(merged));
   }
 
   Future<void> logout(BuildContext context) async {
     try {
+      // Unregister THIS device's FCM token while JWT is still present in storage
       final currentUser = _ref.read(currentUserProvider);
+      final notifService = _ref.read(notificationServiceProvider);
 
-      if (currentUser != null) {
-        try {
-          // Tell backend to drop the FCM token from the database
-          await _api.dio.post('/fcm/remove-fcm', data: {});
+      await notifService.unregisterTokenOnLogout();
 
-          final mobile = currentUser['mobile']?.toString();
-          await _ref
-              .read(notificationServiceProvider)
-              .unsubscribeFromTopics(mobile);
-        } catch (e) {
-          log('FCM Unsubscribe Error (Ignored): $e');
-        }
+      // Clean up any legacy client-side topic subscriptions on older installs
+      final mobile = currentUser?['mobile']?.toString();
+      if (mobile != null && mobile.isNotEmpty) {
+        await notifService.unsubscribeFromTopics(mobile);
       }
-    } catch (_) {
+    } catch (e) {
+      log('⚠️ FCM logout cleanup error (ignored): $e');
     } finally {
-      // ✅ Disconnect socket BEFORE wiping storage to ensure clean teardown
-      _ref.read(socketServiceProvider).disconnect();
+      await clearSession();
 
-      // 1. Clear local storage (this automatically removes the token for all future API calls)
-      await _api.storage.delete(key: 'jwt_token');
-      await _api.storage.delete(key: 'user_id');
-      await _api.storage.delete(key: 'user_data');
-
-      // 2. Reset Riverpod auth state
-      _ref.read(isAuthenticatedProvider.notifier).state = false;
-      _ref.read(currentUserProvider.notifier).state = null;
-
-      // Navigate home
       if (context.mounted) {
         context.go('/home');
       }
     }
+  }
+
+  /// Context-free local teardown (usable from 401 interceptors and corrupt-storage recovery).
+  Future<void> clearSession() async {
+    _ref.read(socketServiceProvider).disconnect();
+
+    await Future.wait([
+      _api.storage.delete(key: _jwtKey),
+      _api.storage.delete(key: _userIdKey),
+      _api.storage.delete(key: _userDataKey),
+    ]);
+
+    _ref.read(isAuthenticatedProvider.notifier).state = false;
+    _ref.read(currentUserProvider.notifier).state = null;
+  }
+
+  /// Runs FCM token registration and Socket.io connection in parallel with
+  /// isolated error handling so a failure in one never blocks the other.
+  Future<void> _initRealtimeServices(String userId) async {
+    await Future.wait([
+      _ref
+          .read(notificationServiceProvider)
+          .registerTokenAfterLogin()
+          .catchError((Object e) {
+            log('⚠️ FCM token registration skipped: $e');
+          }),
+      _ref.read(socketServiceProvider).connect(userId).catchError((Object e) {
+        log('⚠️ Socket connection skipped: $e');
+      }),
+    ]);
   }
 }

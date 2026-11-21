@@ -7,11 +7,11 @@ class ChatMessageModel {
   final bool isRead;
   final String createdAt;
 
-  // ✅ ADDED: Required for Optimistic UI Updates & Error Handling
+  // Optimistic UI state
   final bool isSending;
   final bool isFailed;
 
-  ChatMessageModel({
+  const ChatMessageModel({
     required this.id,
     required this.chatSessionId,
     required this.senderId,
@@ -19,27 +19,42 @@ class ChatMessageModel {
     this.imageUrl,
     required this.isRead,
     required this.createdAt,
-    this.isSending = false, // Defaults to false for normal backend messages
-    this.isFailed = false, // Defaults to false
+    this.isSending = false,
+    this.isFailed = false,
   });
 
   factory ChatMessageModel.fromJson(Map<String, dynamic> json) {
+    final rawText = (json['text'] ?? json['content'])?.toString().trim();
+    final rawImage = (json['image_url'] ?? json['imageUrl'])?.toString().trim();
+
     return ChatMessageModel(
-      id: json['id'].toString(),
+      id: json['id']?.toString() ?? '',
       chatSessionId:
-          json['chat_session_id']?.toString() ??
-          json['chatSessionId']?.toString() ??
-          '',
-      senderId:
-          json['sender_id']?.toString() ?? json['senderId']?.toString() ?? '',
-      text: json['text'],
-      imageUrl: json['image_url'] ?? json['imageUrl'],
-      isRead: json['is_read'] == true || json['isRead'] == true,
+          (json['chat_session_id'] ?? json['chatSessionId'])?.toString() ?? '',
+      senderId: (json['sender_id'] ?? json['senderId'])?.toString() ?? '',
+      text: (rawText != null && rawText.isNotEmpty) ? rawText : null,
+      imageUrl: (rawImage != null && rawImage.isNotEmpty) ? rawImage : null,
+      isRead: _parseBool(json['is_read'] ?? json['isRead']),
       createdAt:
-          json['created_at'] ??
-          json['createdAt'] ??
-          DateTime.now().toUtc().toIso8601String(), // Ensure fallback is UTC
+          (json['created_at'] ?? json['createdAt'])?.toString() ??
+          DateTime.now().toUtc().toIso8601String(),
+      isSending: _parseBool(json['isSending']),
+      isFailed: _parseBool(json['isFailed']),
     );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'chat_session_id': chatSessionId,
+      'sender_id': senderId,
+      'text': text,
+      'image_url': imageUrl,
+      'is_read': isRead,
+      'created_at': createdAt,
+      'isSending': isSending,
+      'isFailed': isFailed,
+    };
   }
 
   ChatMessageModel copyWith({
@@ -64,5 +79,15 @@ class ChatMessageModel {
       isSending: isSending ?? this.isSending,
       isFailed: isFailed ?? this.isFailed,
     );
+  }
+
+  static bool _parseBool(dynamic value) {
+    if (value is bool) return value;
+    if (value is int) return value == 1;
+    if (value is String) {
+      final lower = value.toLowerCase();
+      return lower == 'true' || lower == '1';
+    }
+    return false;
   }
 }

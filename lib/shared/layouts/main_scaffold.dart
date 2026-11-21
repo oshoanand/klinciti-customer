@@ -43,12 +43,8 @@ class _MainScaffoldState extends ConsumerState<MainScaffold> {
   Widget build(BuildContext context) {
     final currentIndex = widget.navigationShell.currentIndex;
 
-    final chatState = ref.watch(chatSessionsProvider);
-    final totalUnreadCount = chatState.maybeWhen(
-      data: (sessions) =>
-          sessions.fold<int>(0, (sum, session) => sum + session.unreadCount),
-      orElse: () => 0,
-    );
+    // Use the standalone unread count provider for optimized rebuilds
+    final totalUnreadCount = ref.watch(totalUnreadChatCountProvider);
 
     // PopScope intercepts the Android Back Button to route to Home instead of exiting
     return PopScope(
@@ -66,16 +62,16 @@ class _MainScaffoldState extends ConsumerState<MainScaffold> {
         extendBody: true,
         bottomNavigationBar: Container(
           margin: EdgeInsets.only(
-            bottom: MediaQuery.of(context).padding.bottom + 8,
+            bottom: MediaQuery.paddingOf(context).bottom + 8,
             left: 16,
             right: 16,
           ),
           decoration: BoxDecoration(
-            color: Colors.white.withOpacity(0.95),
+            color: Colors.white.withValues(alpha: 0.95),
             borderRadius: BorderRadius.circular(30),
             boxShadow: [
               BoxShadow(
-                color: Colors.black.withOpacity(0.1),
+                color: Colors.black.withValues(alpha: 0.1),
                 blurRadius: 20,
                 offset: const Offset(0, 4),
               ),
@@ -138,10 +134,11 @@ class _NavItem extends StatelessWidget {
     required this.onTap,
     this.badge = 0,
   });
-
   @override
   Widget build(BuildContext context) {
-    final color = isSelected ? const Color(0xFF0F172A) : Colors.grey.shade400;
+    final color = isSelected
+        ? const Color.fromARGB(255, 224, 120, 15) // or const Color(0xFFE0780F)
+        : Colors.grey.shade400;
 
     return GestureDetector(
       onTap: onTap,

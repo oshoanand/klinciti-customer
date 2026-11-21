@@ -1,12 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
 
-import '../../providers/chat_sessions_provider.dart';
 import '../../../../core/router/route_names.dart';
+import '../../data/models/chat_session_model.dart';
+import '../../providers/chat_sessions_provider.dart';
 
 class ChatInboxScreen extends ConsumerWidget {
   const ChatInboxScreen({super.key});
@@ -14,6 +15,7 @@ class ChatInboxScreen extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final sessionsState = ref.watch(chatSessionsProvider);
+    final totalUnread = ref.watch(totalUnreadChatCountProvider);
 
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: const SystemUiOverlayStyle(
@@ -21,30 +23,72 @@ class ChatInboxScreen extends ConsumerWidget {
         statusBarIconBrightness: Brightness.dark,
       ),
       child: Scaffold(
-        backgroundColor: const Color(0xFFF8FAFC), // Premium Slate background
+        backgroundColor: const Color(0xFFF8FAFC),
         appBar: AppBar(
-          backgroundColor: Colors.transparent,
-          surfaceTintColor: Colors.transparent,
+          backgroundColor: Colors.white,
+          surfaceTintColor: Colors.white,
           elevation: 0,
-          leading: Padding(
-            padding: const EdgeInsets.only(left: 12.0),
-            child: IconButton(
+          leading: context.canPop()
+              ? IconButton(
+                  icon: const Icon(
+                    LucideIcons.arrow_left,
+                    color: Color(0xFF0F172A),
+                  ),
+                  onPressed: () => context.pop(),
+                )
+              : const Padding(
+                  padding: EdgeInsets.only(left: 16.0),
+                  child: Icon(
+                    LucideIcons.message_circle_more,
+                    color: Color(0xFF0F172A),
+                  ),
+                ),
+          title: Row(
+            children: [
+              const Text(
+                'Сообщения',
+                style: TextStyle(
+                  fontWeight: FontWeight.w800,
+                  color: Color(0xFF0F172A),
+                  letterSpacing: -0.5,
+                  fontSize: 22,
+                ),
+              ),
+              if (totalUnread > 0) ...[
+                const SizedBox(width: 10),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 9,
+                    vertical: 3,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF3B82F6),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    totalUnread > 99 ? '99+' : totalUnread.toString(),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+          actions: [
+            IconButton(
               icon: const Icon(
-                LucideIcons.message_circle_more,
+                LucideIcons.refresh_cw,
+                size: 18,
                 color: Color(0xFF0F172A),
               ),
-              onPressed: () => context.pop(),
+              tooltip: 'Обновить',
+              onPressed: () =>
+                  ref.read(chatSessionsProvider.notifier).refresh(),
             ),
-          ),
-          title: const Text(
-            'Список чатов',
-            style: TextStyle(
-              fontWeight: FontWeight.w800,
-              color: Color(0xFF0F172A),
-              letterSpacing: -0.5,
-              fontSize: 22,
-            ),
-          ),
+          ],
           centerTitle: false,
         ),
         body: RefreshIndicator(
@@ -64,7 +108,7 @@ class ChatInboxScreen extends ConsumerWidget {
                   borderRadius: BorderRadius.circular(24),
                   boxShadow: [
                     BoxShadow(
-                      color: Colors.black.withOpacity(0.03),
+                      color: Colors.black.withValues(alpha: 0.03),
                       blurRadius: 24,
                       offset: const Offset(0, 10),
                     ),
@@ -87,11 +131,22 @@ class ChatInboxScreen extends ConsumerWidget {
                     ),
                     const SizedBox(height: 16),
                     Text(
-                      'Ошибка загрузки\n$err',
+                      'Ошибка загрузки чатов\n$err',
                       textAlign: TextAlign.center,
                       style: TextStyle(
                         color: Colors.grey.shade600,
                         fontSize: 13,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    ElevatedButton.icon(
+                      onPressed: () =>
+                          ref.read(chatSessionsProvider.notifier).refresh(),
+                      icon: const Icon(LucideIcons.refresh_cw, size: 16),
+                      label: const Text('Повторить'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF0F172A),
+                        foregroundColor: Colors.white,
                       ),
                     ),
                   ],
@@ -99,263 +154,23 @@ class ChatInboxScreen extends ConsumerWidget {
               ),
             ),
             data: (sessions) {
-              // ✅ 1. Determine if we need to show the injected support card
-              final hasActiveAdminSession = sessions.any(
-                (s) => s.isAdmin == true,
-              );
-              final showPinnedSupport = !hasActiveAdminSession;
-
-              // ✅ 2. Handle completely empty state (no support card needed & no sessions)
-              if (sessions.isEmpty && !showPinnedSupport) {
+              if (sessions.isEmpty) {
                 return _buildEmptyState();
               }
-
-              // ✅ 3. SORTING LOGIC: Pin Support/Admins to the top, then sort by latest message
-              final sortedSessions = List.of(sessions)
-                ..sort((a, b) {
-                  final aName = a.partnerName?.toLowerCase() ?? '';
-                  final bName = b.partnerName?.toLowerCase() ?? '';
-
-                  final aIsAdmin =
-                      aName.contains('admin') ||
-                      aName.contains('support') ||
-                      aName.contains('поддержка');
-                  final bIsAdmin =
-                      bName.contains('admin') ||
-                      bName.contains('support') ||
-                      bName.contains('поддержка');
-
-                  if (aIsAdmin && !bIsAdmin) return -1;
-                  if (!aIsAdmin && bIsAdmin) return 1;
-
-                  final aDate = DateTime.parse(a.updatedAt);
-                  final bDate = DateTime.parse(b.updatedAt);
-                  return bDate.compareTo(aDate);
-                });
-
-              // Calculate total items including the pinned support card if it exists
-              final itemCount = showPinnedSupport
-                  ? sortedSessions.length + 1
-                  : sortedSessions.length;
 
               return ListView.separated(
                 physics: const AlwaysScrollableScrollPhysics(
                   parent: BouncingScrollPhysics(),
                 ),
                 padding: const EdgeInsets.only(top: 8, bottom: 32),
-                itemCount: itemCount,
+                itemCount: sessions.length,
                 separatorBuilder: (context, index) => Padding(
                   padding: const EdgeInsets.only(left: 88, right: 24),
                   child: Divider(height: 1, color: Colors.grey.shade200),
                 ),
                 itemBuilder: (context, index) {
-                  // ✅ 4. Inject Pinned Support Card at index 0 if required
-                  if (showPinnedSupport && index == 0) {
-                    return _buildPinnedSupportCard(context);
-                  }
-
-                  // Adjust index for standard sessions
-                  final sessionIndex = showPinnedSupport ? index - 1 : index;
-                  final session = sortedSessions[sessionIndex];
-
-                  final date = DateTime.parse(session.updatedAt).toLocal();
-                  final isUnread = session.unreadCount > 0;
-                  final sessionName = session.partnerName?.toLowerCase() ?? '';
-                  final isAdmin =
-                      sessionName.contains('admin') ||
-                      sessionName.contains('support') ||
-                      sessionName.contains('поддержка');
-
-                  return Material(
-                    color: isAdmin
-                        ? Colors.blue.shade50.withOpacity(0.3)
-                        : Colors.transparent,
-                    child: InkWell(
-                      onTap: () {
-                        context.push(
-                          '${AppRoutes.chatDetail}/${session.id}/${session.partnerId}',
-                          // ✅ Pass the extra map here!
-                          extra: {
-                            'partnerName': session.partnerName,
-                            'partnerAvatar': session.partnerAvatar,
-                          },
-                        );
-                      },
-                      highlightColor: Colors.grey.shade100,
-                      splashColor: Colors.grey.shade50,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 24,
-                          vertical: 16,
-                        ),
-                        child: Row(
-                          children: [
-                            Stack(
-                              children: [
-                                CircleAvatar(
-                                  radius: 28,
-                                  backgroundColor: isAdmin
-                                      ? const Color(0xFF3B82F6).withOpacity(0.1)
-                                      : const Color(0xFF0F172A)
-                                            .withOpacity(0.05),
-                                  backgroundImage: session.partnerAvatar != null
-                                      ? NetworkImage(session.partnerAvatar!)
-                                      : null,
-                                  child: session.partnerAvatar == null
-                                      ? Icon(
-                                          isAdmin
-                                              ? LucideIcons.shield_check
-                                              : LucideIcons.user,
-                                          color: isAdmin
-                                              ? const Color(0xFF3B82F6)
-                                              : const Color(0xFF64748B),
-                                          size: 24,
-                                        )
-                                      : null,
-                                ),
-                                Positioned(
-                                  right: 0,
-                                  bottom: 0,
-                                  child: Container(
-                                    width: 14,
-                                    height: 14,
-                                    decoration: BoxDecoration(
-                                      color: session.isOnline
-                                          ? Colors.green
-                                          : Colors.grey.shade400,
-                                      shape: BoxShape.circle,
-                                      border: Border.all(
-                                        color: Colors.white,
-                                        width: 2,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(width: 16),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Row(
-                                    mainAxisAlignment:
-                                        MainAxisAlignment.spaceBetween,
-                                    children: [
-                                      Expanded(
-                                        child: Row(
-                                          children: [
-                                            Flexible(
-                                              child: Text(
-                                                session.partnerName ??
-                                                    'ID: ${session.partnerId.length >= 6 ? session.partnerId.substring(0, 6) : session.partnerId}',
-                                                maxLines: 1,
-                                                overflow: TextOverflow.ellipsis,
-                                                style: TextStyle(
-                                                  fontWeight: isUnread
-                                                      ? FontWeight.w800
-                                                      : FontWeight.w600,
-                                                  fontSize: 16,
-                                                  color: isAdmin
-                                                      ? const Color(0xFF3B82F6)
-                                                      : const Color(0xFF0F172A),
-                                                ),
-                                              ),
-                                            ),
-                                            if (isAdmin)
-                                              const Padding(
-                                                padding: EdgeInsets.only(
-                                                  left: 6.0,
-                                                ),
-                                                child: Icon(
-                                                  LucideIcons.badge_check,
-                                                  size: 16,
-                                                  color: Color(0xFF3B82F6),
-                                                ),
-                                              ),
-                                          ],
-                                        ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      Text(
-                                        _formatLastMessageDate(date),
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          color: isUnread
-                                              ? const Color(0xFF3B82F6)
-                                              : Colors.grey.shade500,
-                                          fontWeight: isUnread
-                                              ? FontWeight.bold
-                                              : FontWeight.w500,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Row(
-                                    children: [
-                                      Expanded(
-                                        child: session.isTyping
-                                            ? const Text(
-                                                'Печатает...',
-                                                maxLines: 1,
-                                                overflow: TextOverflow.ellipsis,
-                                                style: TextStyle(
-                                                  color: Color(0xFF3B82F6),
-                                                  fontWeight: FontWeight.w600,
-                                                  fontSize: 14,
-                                                  fontStyle: FontStyle.italic,
-                                                ),
-                                              )
-                                            : Text(
-                                                session.lastMessage ??
-                                                    '📷 Вложение',
-                                                maxLines: 1,
-                                                overflow: TextOverflow.ellipsis,
-                                                style: TextStyle(
-                                                  color: isUnread
-                                                      ? const Color(0xFF0F172A)
-                                                      : Colors.grey.shade600,
-                                                  fontWeight: isUnread
-                                                      ? FontWeight.w600
-                                                      : FontWeight.normal,
-                                                  fontSize: 14,
-                                                ),
-                                              ),
-                                      ),
-                                      if (isUnread)
-                                        Container(
-                                          margin: const EdgeInsets.only(
-                                            left: 8,
-                                          ),
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 8,
-                                            vertical: 4,
-                                          ),
-                                          decoration: const BoxDecoration(
-                                            color: Color(0xFF3B82F6),
-                                            shape: BoxShape.circle,
-                                          ),
-                                          child: Text(
-                                            session.unreadCount.toString(),
-                                            style: const TextStyle(
-                                              color: Colors.white,
-                                              fontSize: 12,
-                                              fontWeight: FontWeight.bold,
-                                              height: 1,
-                                            ),
-                                          ),
-                                        ),
-                                    ],
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  );
+                  final session = sessions[index];
+                  return _buildSessionTile(context, session);
                 },
               );
             },
@@ -365,67 +180,242 @@ class ChatInboxScreen extends ConsumerWidget {
     );
   }
 
-  // ====================================================================
-  // PINNED SUPPORT CARD (Matches existing list UI)
-  // ====================================================================
-  Widget _buildPinnedSupportCard(BuildContext context) {
+  Widget _buildSessionTile(BuildContext context, ChatSessionModel session) {
+    final date =
+        DateTime.tryParse(session.updatedAt)?.toLocal() ?? DateTime.now();
+    final isUnread = session.unreadCount > 0;
+    final isAdmin = session.isAdmin;
+    final hasAvatar =
+        session.partnerAvatar != null &&
+        session.partnerAvatar!.trim().isNotEmpty;
+
+    final String presenceText = _formatPresence(
+      isOnline: session.isOnline,
+      lastSeenRaw: session.lastSeen,
+      isAdmin: isAdmin,
+    );
+
     return Material(
-      color: Colors.blue.shade50.withOpacity(0.3),
+      color: isAdmin
+          ? Colors.blue.shade50.withValues(alpha: 0.35)
+          : Colors.white,
       child: InkWell(
         onTap: () {
-          // Routes to the special "new_admin" path
-          context.push('/chat/new_admin/admin');
+          context.push(
+            '${AppRoutes.chatDetail}/${session.id}/${session.partnerId}',
+            extra: {
+              'partnerName': session.partnerName,
+              'partnerAvatar': session.partnerAvatar,
+              'isOnline': session.isOnline,
+              'lastSeen': session.lastSeen,
+              'isAdmin': session.isAdmin,
+            },
+          );
         },
         highlightColor: Colors.grey.shade100,
         splashColor: Colors.grey.shade50,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
           child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              CircleAvatar(
-                radius: 28,
-                backgroundColor: const Color(0xFF3B82F6).withOpacity(0.1),
-                child: const Icon(
-                  LucideIcons.shield_check,
-                  color: Color(0xFF3B82F6),
-                  size: 24,
-                ),
+              // Avatar with Online / Offline Presence Dot
+              Stack(
+                children: [
+                  CircleAvatar(
+                    radius: 28,
+                    backgroundColor: isAdmin
+                        ? const Color(0xFF3B82F6).withValues(alpha: 0.12)
+                        : const Color(0xFF0F172A).withValues(alpha: 0.06),
+                    backgroundImage: hasAvatar
+                        ? NetworkImage(session.partnerAvatar!)
+                        : null,
+                    child: !hasAvatar
+                        ? Icon(
+                            isAdmin
+                                ? LucideIcons.shield_check
+                                : LucideIcons.user,
+                            color: isAdmin
+                                ? const Color(0xFF3B82F6)
+                                : const Color(0xFF64748B),
+                            size: 24,
+                          )
+                        : null,
+                  ),
+                  Positioned(
+                    right: 0,
+                    bottom: 0,
+                    child: Container(
+                      width: 14,
+                      height: 14,
+                      decoration: BoxDecoration(
+                        color: session.isOnline
+                            ? Colors.green
+                            : Colors.grey.shade400,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: Colors.white, width: 2),
+                      ),
+                    ),
+                  ),
+                ],
               ),
-              const SizedBox(width: 16),
-              const Expanded(
+              const SizedBox(width: 14),
+
+              // Middle Content: Name, Admin Badge, Presence/Last Seen, and Message Preview
+              Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    // Row 1: Name + Admin Role Pill + Timestamp
                     Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        Flexible(
-                          child: Text(
-                            'Служба поддержки',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+                        Expanded(
+                          child: Row(
+                            children: [
+                              Flexible(
+                                child: Text(
+                                  session.partnerName ??
+                                      (isAdmin
+                                          ? 'Администратор Klinciti'
+                                          : 'Пользователь'),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontWeight: isUnread
+                                        ? FontWeight.w800
+                                        : FontWeight.w700,
+                                    fontSize: 16,
+                                    color: isAdmin
+                                        ? const Color(0xFF1D4ED8)
+                                        : const Color(0xFF0F172A),
+                                  ),
+                                ),
+                              ),
+                              if (isAdmin) ...[
+                                const SizedBox(width: 5),
+                                const Icon(
+                                  LucideIcons.badge_check,
+                                  size: 16,
+                                  color: Color(0xFF3B82F6),
+                                ),
+                                const SizedBox(width: 6),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 6,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF3B82F6)
+                                        .withValues(alpha: 0.12),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: const Text(
+                                    'Админ',
+                                    style: TextStyle(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.bold,
+                                      color: Color(0xFF2563EB),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        if (!session.id.startsWith('new_'))
+                          Text(
+                            _formatLastMessageDate(date),
                             style: TextStyle(
-                              fontWeight: FontWeight.w600,
-                              fontSize: 16,
-                              color: Color(0xFF3B82F6),
+                              fontSize: 12,
+                              color: isUnread
+                                  ? const Color(0xFF3B82F6)
+                                  : Colors.grey.shade500,
+                              fontWeight: isUnread
+                                  ? FontWeight.bold
+                                  : FontWeight.w500,
                             ),
                           ),
-                        ),
-                        Padding(
-                          padding: EdgeInsets.only(left: 6.0),
-                          child: Icon(
-                            LucideIcons.badge_check,
-                            size: 16,
-                            color: Color(0xFF3B82F6),
-                          ),
-                        ),
                       ],
                     ),
-                    SizedBox(height: 4),
+                    const SizedBox(height: 2),
+
+                    // Row 2: Online / Last Seen Status
                     Text(
-                      'Напишите нам, если у вас есть вопросы',
+                      presenceText,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: TextStyle(color: Color(0xFF0F172A), fontSize: 14),
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: session.isOnline
+                            ? FontWeight.w600
+                            : FontWeight.normal,
+                        color: session.isOnline
+                            ? Colors.green.shade700
+                            : Colors.grey.shade500,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+
+                    // Row 3: Typing indicator or Last Message + Unread Count Badge
+                    Row(
+                      children: [
+                        Expanded(
+                          child: session.isTyping
+                              ? const Text(
+                                  'Печатает...',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    color: Color(0xFF3B82F6),
+                                    fontWeight: FontWeight.w600,
+                                    fontSize: 14,
+                                    fontStyle: FontStyle.italic,
+                                  ),
+                                )
+                              : Text(
+                                  session.lastMessage ??
+                                      (isAdmin
+                                          ? 'Напишите администратору по любому вопросу'
+                                          : '📷 Фото'),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    color: isUnread
+                                        ? const Color(0xFF0F172A)
+                                        : Colors.grey.shade600,
+                                    fontWeight: isUnread
+                                        ? FontWeight.w600
+                                        : FontWeight.normal,
+                                    fontSize: 13.5,
+                                  ),
+                                ),
+                        ),
+                        if (isUnread)
+                          Container(
+                            margin: const EdgeInsets.only(left: 8),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF3B82F6),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Text(
+                              session.unreadCount > 99
+                                  ? '99+'
+                                  : session.unreadCount.toString(),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.bold,
+                                height: 1,
+                              ),
+                            ),
+                          ),
+                      ],
                     ),
                   ],
                 ),
@@ -435,6 +425,35 @@ class ChatInboxScreen extends ConsumerWidget {
         ),
       ),
     );
+  }
+
+  String _formatPresence({
+    required bool isOnline,
+    required String? lastSeenRaw,
+    required bool isAdmin,
+  }) {
+    if (isOnline) {
+      return 'В сети';
+    }
+    if (lastSeenRaw != null && lastSeenRaw.isNotEmpty) {
+      final parsed = DateTime.tryParse(lastSeenRaw)?.toLocal();
+      if (parsed != null) {
+        final now = DateTime.now();
+        final today = DateTime(now.year, now.month, now.day);
+        final yesterday = today.subtract(const Duration(days: 1));
+        final seenDay = DateTime(parsed.year, parsed.month, parsed.day);
+        final timeStr = DateFormat('HH:mm').format(parsed);
+
+        if (seenDay == today) {
+          return 'Был(а) в сети сегодня в $timeStr';
+        } else if (seenDay == yesterday) {
+          return 'Был(а) в сети вчера в $timeStr';
+        } else {
+          return 'Был(а) в сети ${DateFormat('dd.MM.yy').format(parsed)} в $timeStr';
+        }
+      }
+    }
+    return isAdmin ? 'Служба поддержки Klinciti' : 'Не в сети';
   }
 
   Widget _buildEmptyState() {
@@ -453,7 +472,7 @@ class ChatInboxScreen extends ConsumerWidget {
                   shape: BoxShape.circle,
                   boxShadow: [
                     BoxShadow(
-                      color: Colors.black.withOpacity(0.03),
+                      color: Colors.black.withValues(alpha: 0.03),
                       blurRadius: 16,
                       offset: const Offset(0, 8),
                     ),
@@ -476,7 +495,7 @@ class ChatInboxScreen extends ConsumerWidget {
               ),
               const SizedBox(height: 8),
               Text(
-                'Здесь появятся ваши переписки\nс клиентами и мастерами.',
+                'Здесь появятся ваши переписки\nс администраторами и мастерами.',
                 textAlign: TextAlign.center,
                 style: TextStyle(color: Colors.grey.shade500),
               ),

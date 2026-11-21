@@ -1,121 +1,214 @@
+import 'dart:async';
 import 'dart:developer';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:socket_io_client/socket_io_client.dart' as io;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:socket_io_client/socket_io_client.dart' as io;
 
 import '../network/api_client.dart';
 
+typedef SocketEventCallback = void Function(dynamic data);
+
 final socketServiceProvider = Provider<SocketService>((ref) {
-  return SocketService();
+  final service = SocketService();
+  ref.onDispose(service.dispose);
+  return service;
 });
 
 class SocketService {
   io.Socket? _socket;
-  final _storage = const FlutterSecureStorage();
+  final FlutterSecureStorage _storage = const FlutterSecureStorage();
 
-  // Cache listeners if services try to listen BEFORE the user logs in!
-  final Map<String, List<Function(dynamic)>> _pendingListeners = {};
+  // Persistent listener registry so long-lived services (e.g. NotificationService)
+  // automatically reattach after disconnect/reconnect or account switches.
+  final Map<String, Set<SocketEventCallback>> _listeners = {};
+
+  final StreamController<bool> _connectionController =
+      StreamController<bool>.broadcast();
+
+  String? _currentUserId;
+  bool _isConnecting = false;
+  bool _isDisposed = false;
 
   bool get isConnected => _socket?.connected ?? false;
+  String? get currentUserId => _currentUserId;
+  Stream<bool> get connectionStream => _connectionController.stream;
 
   Future<void> connect(String userId) async {
-    if (_socket?.connected == true) return;
+    if (_isDisposed || userId.trim().isEmpty) return;
 
-    final token = await _storage.read(key: 'jwt_token');
+    // Already connected (or connecting) for this exact user
+    if (_currentUserId == userId &&
+        (_socket?.connected == true || _isConnecting)) {
+      return;
+    }
 
-    // Safely parse URI. `authority` perfectly handles "host:port"
-    // or just "host" for standard http/https, while stripping "/api" paths.
-    final uri = Uri.parse(ApiClient.baseUrl);
-    final String socketUrl = '${uri.scheme}://${uri.authority}';
-
-    _socket = io.io(
-      socketUrl,
-      io.OptionBuilder()
-          .setPath('/socket.io')
-          //  Force WebSocket. Polling causes duplicate connection IDs
-          // and dropping if sticky sessions aren't perfectly configured on the server.
-          .setTransports(['websocket'])
-          .enableReconnection()
-          .setReconnectionAttempts(
-            99999,
-          ) // ✅ Infinite retries for background/foreground recovery
-          .setReconnectionDelay(1000)
-          .setReconnectionDelayMax(5000)
-          .setAuth({'token': token ?? '', 'userId': userId, 'role': 'CUSTOMER'})
-          .disableAutoConnect() // Initialize the object first without connecting
-          .build(),
-    );
-
-    // Apply any listeners that were requested before the socket was initialized
-    _pendingListeners.forEach((event, callbacks) {
-      for (var callback in callbacks) {
-        _socket?.on(event, callback);
+    _isConnecting = true;
+    try {
+      // Tear down any existing socket (stale or belonging to a different user)
+      if (_socket != null) {
+        _teardownSocket();
       }
-    });
-    _pendingListeners.clear();
 
-    _socket?.onConnect((_) {
-      log('✅ Socket Connected to $socketUrl (ID:${_socket?.id})');
-    });
+      _currentUserId = userId;
+      final token = await _storage.read(key: 'jwt_token');
 
-    _socket?.onDisconnect((_) {
-      log('⚠️ Socket Disconnected');
-    });
+      final uri = Uri.tryParse(ApiClient.baseUrl);
+      if (uri == null || uri.host.isEmpty) {
+        log('❌ Invalid ApiClient.baseUrl for socket connection');
+        return;
+      }
 
-    _socket?.onReconnect((attempt) {
-      log('🔄 Socket Reconnected after $attempt attempts');
-    });
+      final String socketUrl = '${uri.scheme}://${uri.authority}';
 
-    _socket?.onConnectError((err) => log('❌ Socket Connection Error: $err'));
-    _socket?.onError((err) => log('❌ Socket Error: $err'));
+      final socket = io.io(
+        socketUrl,
+        io.OptionBuilder()
+            .setPath('/socket.io')
+            .setTransports(['websocket'])
+            .enableReconnection()
+            .setReconnectionAttempts(99999)
+            .setReconnectionDelay(1000)
+            .setReconnectionDelayMax(5000)
+            .setAuth({
+              'token': token ?? '',
+              'userId': userId,
+              'role': 'CUSTOMER',
+            })
+            .disableAutoConnect()
+            .build(),
+      );
 
-    // Finally, connect to the server
-    _socket?.connect();
-  }
+      _socket = socket;
 
-  void listen(String event, Function(dynamic) callback) {
-    if (_socket != null) {
-      _socket?.on(event, callback);
-    } else {
-      // If socket isn't connected yet, save the listener for later!
-      _pendingListeners.putIfAbsent(event, () => []).add(callback);
+      // Re-attach all registered listeners onto the fresh socket instance
+      _listeners.forEach((event, callbacks) {
+        for (final callback in callbacks) {
+          socket.on(event, callback);
+        }
+      });
+
+      socket.onConnect((_) {
+        log('✅ Socket Connected to $socketUrl (ID: ${socket.id})');
+        _emitConnectionState(true);
+      });
+
+      socket.onDisconnect((_) {
+        log('⚠️ Socket Disconnected');
+        _emitConnectionState(false);
+      });
+
+      socket.onReconnect((attempt) {
+        log('🔄 Socket Reconnected after $attempt attempts');
+        _emitConnectionState(true);
+      });
+
+      socket.onReconnectAttempt((_) async {
+        // Refresh JWT in handshake auth in case the token was rotated while offline
+        final freshToken = await _storage.read(key: 'jwt_token');
+        if (freshToken != null &&
+            freshToken.isNotEmpty &&
+            _socket != null &&
+            _currentUserId != null) {
+          _socket!.auth = {
+            'token': freshToken,
+            'userId': _currentUserId!,
+            'role': 'CUSTOMER',
+          };
+        }
+      });
+
+      socket.onConnectError((err) {
+        log('❌ Socket Connection Error: $err');
+        _emitConnectionState(false);
+      });
+
+      socket.onError((err) => log('❌ Socket Error: $err'));
+      socket.on('error', (data) {
+        log('⚠️ Backend Socket Error Event: $data');
+      });
+
+      socket.connect();
+    } finally {
+      _isConnecting = false;
     }
   }
 
-  // Added optional callback.
-  // If you don't pass the callback, it wipes ALL listeners for that event (dangerous).
-  // If you pass it, it only removes that specific screen's listener.
-  void stopListening(String event, [Function(dynamic)? callback]) {
-    if (_socket != null) {
-      if (callback != null) {
-        _socket?.off(event, callback);
-      } else {
-        _socket?.off(event);
+  /// Updates the JWT on the active socket without dropping registered listeners.
+  void updateAuthToken(String token) {
+    if (_socket != null && _currentUserId != null) {
+      _socket!.auth = {
+        'token': token,
+        'userId': _currentUserId!,
+        'role': 'CUSTOMER',
+      };
+    }
+  }
+
+  void listen(String event, SocketEventCallback callback) {
+    final callbacks = _listeners.putIfAbsent(
+      event,
+      () => <SocketEventCallback>{},
+    );
+    final wasAdded = callbacks.add(callback);
+
+    // Attach immediately if a socket exists and this callback wasn't already bound
+    if (wasAdded && _socket != null) {
+      _socket!.on(event, callback);
+    }
+  }
+
+  /// Removes a specific callback if provided, or all listeners for [event] if omitted.
+  void stopListening(String event, [SocketEventCallback? callback]) {
+    if (callback != null) {
+      _listeners[event]?.remove(callback);
+      if (_listeners[event]?.isEmpty ?? false) {
+        _listeners.remove(event);
       }
+      _socket?.off(event, callback);
     } else {
-      if (callback != null) {
-        _pendingListeners[event]?.remove(callback);
-      } else {
-        _pendingListeners.remove(event);
-      }
+      _listeners.remove(event);
+      _socket?.off(event);
     }
   }
 
   void emit(String event, dynamic data) {
     if (_socket != null) {
-      // Let Socket.io handle native offline buffering.
-      _socket?.emit(event, data);
+      _socket!.emit(event, data);
     } else {
-      log('⚠️ Warning: Tried to emit "$event" before socket was initialized.');
+      log('⚠️ Tried to emit "$event" before socket was initialized.');
     }
   }
 
+  /// Disconnects the active socket on logout while preserving persistent service listeners.
   void disconnect() {
-    _socket?.disconnect();
-    _socket?.dispose();
-    _socket = null;
-    _pendingListeners.clear();
-    log('🛑 Socket manually disposed.');
+    _teardownSocket();
+    _currentUserId = null;
+    _emitConnectionState(false);
+    log('🛑 Socket disconnected.');
+  }
+
+  void _teardownSocket() {
+    if (_socket != null) {
+      _socket!.clearListeners();
+      _socket!.disconnect();
+      _socket!.dispose();
+      _socket = null;
+    }
+  }
+
+  void _emitConnectionState(bool connected) {
+    if (!_isDisposed && !_connectionController.isClosed) {
+      _connectionController.add(connected);
+    }
+  }
+
+  void dispose() {
+    if (_isDisposed) return;
+    _isDisposed = true;
+    _teardownSocket();
+    _listeners.clear();
+    _currentUserId = null;
+    _connectionController.close();
   }
 }
